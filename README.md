@@ -3,7 +3,7 @@
 > Coded by Meta's Muse Spark 1.3 (AI coding agent), directed by the repo owner.
 
 CLI-first RGB control for Scroll-Lock-driven keyboards on Linux.
-Targets CachyOS / Arch + KDE Plasma Wayland first.
+Targets Arch Linux first.
 
 Tested on: `1a2c:6003 SEMICO USB Keyboard` (`/sys/class/leds/input5::scrolllock`).
 
