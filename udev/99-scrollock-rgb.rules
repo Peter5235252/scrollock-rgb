@@ -5,7 +5,7 @@
 # Why two mechanisms:
 # - LED sysfs brightness is kernel-enforced for non-root even when mode shows
 #   644, and TAG+="uaccess" only covers /dev nodes via logind, not sysfs.
-#   So user-space writes still go through pkexec at runtime.
+#   So user-space writes still go through sudo at runtime.
 # - Boot/plug activation must be root without interactive auth, hence RUN
 #   (runs as root on device add) + the systemd system unit. No password needed.
 

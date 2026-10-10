@@ -23,14 +23,14 @@ state is ON and Caps/Num reports include Scroll=ON → RGB survives.
 
 ```sh
 scrollock-rgb doctor    # shows [FAIL] XKB before fix
-scrollock-rgb fix-xkb   # pkexec patches /usr/share/X11/xkb/symbols/pc + backup
+scrollock-rgb fix        # one-time setup (uses sudo, then reboot)
 # reboot (or logout/login — KWin Wayland reads XKB at session start)
 # press the physical ScrollLock key once → RGB on, survives Caps/Num
 scrollock-rgb doctor    # shows [OK] XKB
 ```
 
 Backup: `/usr/share/X11/xkb/symbols/pc.bak-scrollock-rgb`.
-Re-run `fix-xkb` after `xkeyboard-config` package updates (they overwrite `/usr/share`).
+Re-run `fix` after `xkeyboard-config` package updates (they overwrite `/usr/share`).
 
 ## Build
 
@@ -61,8 +61,8 @@ With several keyboards, everything applies to all of them; add
 - Caps/Num keys keep working (locking still locks); only their indicator
   lights stay off, because on this firmware a lit Caps/Num LED cuts RGB
   power. `guard --keep-lock-leds` leaves them alone if you prefer the lights.
-- Needs permission for keyboard LEDs → asks once via the system password
-  prompt (pkexec); the boot service runs as root so it never asks.
+- Needs permission for keyboard LEDs → re-runs itself with sudo (one
+  password prompt); the boot service runs as root so it never asks.
 
 ## Permanent rootless access (optional)
 

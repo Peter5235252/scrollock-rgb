@@ -43,7 +43,7 @@ const STATE_DIR: &str = "/var/lib/scrollock-rgb";
     long_about = "RGB control for keyboards whose backlight follows the ScrollLock LED.\n\nEXAMPLES:\n  scrollock-rgb               show RGB state\n  scrollock-rgb on            turn RGB on\n  scrollock-rgb off           turn RGB off\n  scrollock-rgb toggle        flip RGB on/off\n  scrollock-rgb fix           one-time setup so ScrollLock toggles RGB (then reboot)\n  scrollock-rgb doctor        check what is wrong"
 )]
 struct Cli {
-    /// Do not try pkexec elevation (internal flag, prevents recursion)
+    /// Do not try sudo elevation (internal flag, prevents recursion)
     #[arg(long, hide = true, global = true)]
     no_elevate: bool,
 
@@ -365,7 +365,7 @@ fn save_intended(input: &str, on: bool) {
     let _ = fs::write(p, if on { "1\n" } else { "0\n" });
 }
 
-// ---- validated privileged writes + pkexec ----
+// ---- validated privileged writes + sudo ----
 
 /// Validate that `path` is a real sysfs LED file before writing.
 fn validate_sysfs_file(path: &Path, expect: &str) -> Result<PathBuf, String> {
@@ -457,13 +457,13 @@ fn needs_elevation_error(msg: &str) -> bool {
 fn elevate_self() -> ! {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !Path::new("/usr/bin/pkexec").exists() && !Path::new("/bin/pkexec").exists() {
-        eprintln!("need permission to touch keyboard LEDs and pkexec is missing.");
-        eprintln!("Run as root, or install udev/99-scrollock-rgb.rules (boot service covers boot).");
+    if !Path::new("/usr/bin/sudo").exists() && !Path::new("/bin/sudo").exists() {
+        eprintln!("need permission to touch keyboard LEDs and sudo is missing.");
+        eprintln!("Run as root (the boot service already runs as root).");
         process::exit(1);
     }
-    eprintln!("need permission, asking via pkexec…");
-    let mut cmd = Command::new("pkexec");
+    eprintln!("need permission, re-running with sudo…");
+    let mut cmd = Command::new("sudo");
     cmd.arg(exe);
     cmd.args(&args);
     if !args.iter().any(|a| a == "--no-elevate") {
@@ -472,7 +472,7 @@ fn elevate_self() -> ! {
     match cmd.status() {
         Ok(st) => process::exit(st.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("failed to run pkexec: {e}");
+            eprintln!("failed to run sudo: {e}");
             process::exit(1);
         }
     }
