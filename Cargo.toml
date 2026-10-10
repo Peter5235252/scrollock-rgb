@@ -1,0 +1,13 @@
+[package]
+name = "scrollock-rgb"
+version = "0.1.0"
+edition = "2021"
+description = "User-friendly Scroll Lock LED control for RGB keyboards on Linux (Wayland-first)"
+license = "MIT"
+
+[[bin]]
+name = "scrollock-rgb"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

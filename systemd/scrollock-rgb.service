@@ -1,0 +1,19 @@
+[Unit]
+Description=scrollock-rgb guard: keep ScrollLock RGB on, Caps/Num can never kill it
+Documentation=file:/home/csemanpeter/Projektek/scrollock-rgb/README.md
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+# Persistent guard (not oneshot): every 50 ms enforce
+# scroll trigger=none + brightness=1, caps/num trigger=none + brightness=0.
+# A Caps/Num press that kills RGB is repaired within one poll, and Caps/Num
+# LEDs are never allowed to stay lit (firmware latch prevention).
+# Runs as root (system unit) so no pkexec/password is needed.
+ExecStart=/usr/local/bin/scrollock-rgb guard --interval-ms 50
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

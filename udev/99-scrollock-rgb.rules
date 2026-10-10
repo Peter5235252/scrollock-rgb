@@ -1,0 +1,22 @@
+# scrollock-rgb: ScrollLock-driven RGB keyboards (e.g. SEMICO 1a2c:6003).
+# Installed to /etc/udev/rules.d/99-scrollock-rgb.rules, then:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=leds
+#
+# Why two mechanisms:
+# - LED sysfs brightness is kernel-enforced for non-root even when mode shows
+#   644, and TAG+="uaccess" only covers /dev nodes via logind, not sysfs.
+#   So user-space writes still go through pkexec at runtime.
+# - Boot/plug activation must be root without interactive auth, hence RUN
+#   (runs as root on device add) + the systemd system unit. No password needed.
+
+SUBSYSTEM=="leds", KERNEL=="*::scrolllock", TAG+="uaccess"
+SUBSYSTEM=="leds", KERNEL=="*::capslock", TAG+="uaccess"
+SUBSYSTEM=="leds", KERNEL=="*::numlock", TAG+="uaccess"
+
+ATTRS{idVendor}=="1a2c", TAG+="uaccess"
+ATTRS{idVendor}=="0c45", TAG+="uaccess"
+ATTRS{idVendor}=="258a", TAG+="uaccess"
+
+# Boot/plug: detach kernel auto-follow and force ScrollLock LED on (RGB on).
+# Fires as root on device add (boot + replug). No auth required.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*::scrolllock", RUN+="/bin/sh -c 'echo none > /sys%p/trigger; echo 1 > /sys%p/brightness'"
