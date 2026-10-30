@@ -1,6 +1,6 @@
 # scrollock-rgb
 
-> Coded by Meta's Muse Spark 1.3 (AI coding agent), directed by the repo owner.
+> Coded by models in Cline and OpenCode, directed by the repo owner.
 
 CLI-first RGB control for Scroll-Lock-driven keyboards on Linux.
 Targets Arch Linux first.
@@ -101,6 +101,6 @@ Verify: `systemctl is-enabled scrollock-rgb.service` → `enabled`,
 
 ## Authorship and license
 
-Coded by Meta's Muse Spark 1.3 (AI coding agent, working through OpenCode),
+Coded by AI coding agents working through OpenCode and Cline),
 directed, tested, and published by the repository owner. Licensed MIT —
 see `LICENSE`.
