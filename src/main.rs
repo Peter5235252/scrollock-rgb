@@ -27,6 +27,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -730,10 +732,10 @@ fn sysfs_writable(path: &Path) -> bool {
     }
 }
 
-/// One guard step for a single keyboard. Follows the ScrollLock toggle:
-/// a lone ScrollLock change is respected; a change together with Caps/Num
-/// activity is treated as a kill and repaired. Returns a log line when it
-/// acted, or None when everything was already fine.
+/// One guard step for a single keyboard. Applies the intended RGB state and
+/// repairs Caps/Num kills. Toggle intent is updated separately by monitoring
+/// ScrollLock key events, so Caps/Num activity can never be mistaken for a
+/// user toggle (which previously caused strobing/off flicker).
 fn guard_step(
     kb: &Keyboard,
     intended_on: &mut bool,
@@ -743,7 +745,7 @@ fn guard_step(
     // firmware, so clear those before touching ScrollLock.
     let mut lock_activity = false;
     if suppress_locks {
-        for (label, slot) in [("caps", &kb.caps), ("num", &kb.num)] {
+        for (_label, slot) in [("caps", &kb.caps), ("num", &kb.num)] {
             let Some(led) = slot else { continue };
             let cur = reread(led);
             let trig_bad = cur.trigger_active != "none";
@@ -756,7 +758,6 @@ fn guard_step(
             }
             if trig_bad || lit {
                 lock_activity = true;
-                let _ = label;
             }
         }
     }
@@ -767,39 +768,32 @@ fn guard_step(
         write_trigger_none(&s)?;
     }
 
+    let want: u8 = if *intended_on { 1 } else { 0 };
     let s2 = reread(&kb.scroll);
-    if s2.brightness > 0 {
-        if !*intended_on {
-            *intended_on = true;
-            save_intended(&kb.input, true);
-            return Ok(Some(format!(
-                "{}: RGB on (following your ScrollLock toggle)",
-                kb.input
-            )));
-        }
+    let cur: u8 = if s2.brightness > 0 { 1 } else { 0 };
+    if cur == want {
         return Ok(None);
     }
-    // ScrollLock LED is off.
-    if lock_activity && *intended_on {
-        write_brightness(&s2, 1)?;
-        let verify = reread(&kb.scroll);
-        if verify.brightness == 0 {
-            return Err(format!("{}: RGB repair did not stick", kb.input));
-        }
+    write_brightness(&s2, want)?;
+    let verify = reread(&kb.scroll);
+    let got: u8 = if verify.brightness > 0 { 1 } else { 0 };
+    if got != want {
+        return Err(format!(
+            "{}: could not set RGB (wanted {}, got {}, trigger={})",
+            kb.input, want, verify.brightness, verify.trigger_active
+        ));
+    }
+    if want == 1 && lock_activity {
         return Ok(Some(format!(
             "{}: RGB back on (a Caps/Num press had turned it off)",
             kb.input
         )));
     }
-    if !lock_activity && *intended_on {
-        *intended_on = false;
-        save_intended(&kb.input, false);
-        return Ok(Some(format!(
-            "{}: RGB off (following your ScrollLock toggle)",
-            kb.input
-        )));
+    if want == 1 {
+        Ok(Some(format!("{}: RGB on", kb.input)))
+    } else {
+        Ok(Some(format!("{}: RGB off", kb.input)))
     }
-    Ok(None)
 }
 
 fn cmd_guard(
@@ -850,6 +844,42 @@ fn cmd_guard(
         };
         intents.insert(t.input.clone(), v);
     }
+    // Monitor ScrollLock key presses on the keyboards' event nodes so toggle
+    // intent follows the physical key. This is independent of Caps/Num LED
+    // state, which previously caused the guard to misclassify kills as toggles.
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut seen_events: Vec<String> = Vec::new();
+    for t in &pre_targets {
+        for ev in &t.events {
+            if seen_events.iter().any(|e| e == ev) {
+                continue;
+            }
+            seen_events.push(ev.clone());
+            let path = ev.clone();
+            let input = t.input.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                use std::io::Read;
+                let Ok(mut f) = std::fs::File::open(&path) else {
+                    return;
+                };
+                let mut buf = [0u8; 24];
+                loop {
+                    if f.read_exact(&mut buf).is_err() {
+                        break;
+                    }
+                    let ev_type = u16::from_le_bytes([buf[16], buf[17]]);
+                    let ev_code = u16::from_le_bytes([buf[18], buf[19]]);
+                    let ev_value = i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+                    // EV_KEY == 1, KEY_SCROLLLOCK == 70, value 1 == press
+                    if ev_type == 1 && ev_code == 70 && ev_value == 1 {
+                        let _ = tx.send(input.clone());
+                    }
+                }
+            });
+        }
+    }
+
     println!(
         "watching {} keyboard(s) every {} ms — ScrollLock toggles RGB, Caps/Num cannot kill it (Ctrl-C to stop)…",
         pre_targets.len(),
@@ -875,6 +905,14 @@ fn cmd_guard(
             eprintln!("watch: no matching keyboards");
             return 1;
         }
+        // Apply ScrollLock key toggles detected by the event monitor threads.
+        while let Ok(input) = rx.try_recv() {
+            if let Some(v) = intents.get_mut(&input) {
+                *v = !*v;
+                save_intended(&input, *v);
+            }
+        }
+
         for t in targets {
             let intended = intents.entry(t.input.clone()).or_insert_with(|| {
                 match load_intended(&t.input) {
@@ -885,6 +923,10 @@ fn cmd_guard(
                     }
                 }
             });
+            // Pick up intent changes made by the CLI (or other processes).
+            if let Some(v) = load_intended(&t.input) {
+                *intended = v;
+            }
             match guard_step(t, intended, suppress_locks) {
                 Ok(Some(line)) => println!("{line}"),
                 Ok(None) => {}
