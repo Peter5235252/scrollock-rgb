@@ -1,8 +1,8 @@
 [package]
 name = "scrollock-rgb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "User-friendly Scroll Lock LED control for RGB keyboards on Linux (Wayland-first)"
+description = "Cross-desktop ScrollLock RGB control for Linux (KDE, GNOME, Hyprland, Sway, X11)"
 license = "MIT"
 
 [[bin]]

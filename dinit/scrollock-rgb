@@ -1,0 +1,4 @@
+# scrollock-rgb guard (dinit)
+type = process
+command = /usr/local/bin/scrollock-rgb guard --interval-ms 50
+restart = true

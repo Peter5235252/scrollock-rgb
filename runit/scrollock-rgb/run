@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/bin/scrollock-rgb guard --interval-ms 50 2>&1

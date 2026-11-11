@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+
+description="scrollock-rgb guard: keep ScrollLock RGB in sync and repair Caps/Num kills"
+command="/usr/local/bin/scrollock-rgb"
+command_args="guard --interval-ms 50"
+command_background=true
+pidfile="/run/scrollock-rgb.pid"
+
+depend() {
+    need localmount
+    after udev
+}

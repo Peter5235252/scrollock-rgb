@@ -1,12 +1,22 @@
 //! scrollock-rgb — friendly RGB control for ScrollLock-driven keyboards.
 //!
 //! How it works (1a2c:6003 class): the RGB strip is wired to the ScrollLock
-//! LED. Pressing ScrollLock toggles RGB (needs the `fix` one-time setup).
-//! Pressing Caps/Num makes the kernel send a combined LED report that can
-//! turn the ScrollLock LED off and light the Caps/Num LEDs; on some firmware
-//! a lit Caps/Num LED cuts RGB power and latches it off. The `guard` daemon
-//! repairs kills and keeps Caps/Num LEDs off, and it *follows* your
-//! ScrollLock toggle instead of fighting it (no strobing).
+//! LED. Pressing ScrollLock toggles RGB. Pressing Caps/Num makes the desktop
+//! send a combined LED report built from the XKB lock state; if ScrollLock is
+//! not a real modifier, that report turns the ScrollLock LED off and the
+//! keyboard latches RGB off. `fix` adds the standard `scrolllock:mod3` XKB
+//! option to the *current desktop's own* keyboard config (Hyprland, Sway, KDE,
+//! GNOME, niri, generic Wayland, or X11), so the ScrollLock state survives
+//! Caps/Num presses on every compositor. After that the desktop owns the
+//! toggle; the `guard` daemon follows it and only repairs Caps/Num kills. It
+//! deliberately does not enforce a remembered toggle, because doing so would
+//! fight the compositor (the old `--emulate-toggle` mode is opt-in only).
+//!
+//! Hyprland owns keyboard LEDs and re-syncs them to its XKB state on every key
+//! press. If its keymap lacks `scrolllock:mod3`, it clears the ScrollLock LED
+//! and any daemon that writes the LED back has to fight it every poll — that
+//! is the RGB flicker. Adding the option makes Hyprland's LED reports stay on,
+//! and the guard simply accepts them, so there is nothing to fight over.
 //!
 //! Memory-safety contract (no `unsafe` anywhere in this crate):
 //! - Only safe `std` APIs (`fs`, `env`, `process`, `thread`, `time`,
@@ -17,35 +27,51 @@
 //! - `--device` never becomes a path; paths come only from enumerating
 //!   `/sys/class/input/inputN`. State-file names are built from validated
 //!   `inputN` names only, under the fixed dir `/var/lib/scrollock-rgb`.
+//! - Desktop config files are only edited below the user's home/config dir;
+//!   symlinks that escape those roots are refused. Every edit is backed up.
 //! - No panicking indexing: `strip_prefix`, checked parsing, `unwrap_or`
-//!   only. All reads are tiny bounded sysfs/state files.
+//!   only. All reads are tiny bounded sysfs/state/config files.
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+mod desktop;
+mod elevate;
+mod util;
+mod xkbconf;
+
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+
+use desktop::DesktopKind;
+use elevate::{elevate_self, needs_elevation_error};
+use util::{config_home, home_dir, is_root, run_output};
+use xkbconf::{xkb_options_contain, XKB_OPTION};
 
 const LEDS_CLASS: &str = "/sys/class/leds";
 const INPUT_CLASS: &str = "/sys/class/input";
 const STATE_DIR: &str = "/var/lib/scrollock-rgb";
+const KEY_SCROLLLOCK: u16 = 70;
+const KEY_CAPSLOCK: u16 = 58;
+const KEY_NUMLOCK: u16 = 69;
+const EV_KEY: u16 = 1;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "scrollock-rgb",
     version,
     about = "RGB control for ScrollLock-driven keyboards (ScrollLock toggles RGB)",
-    long_about = "RGB control for keyboards whose backlight follows the ScrollLock LED.\n\nEXAMPLES:\n  scrollock-rgb               show RGB state\n  scrollock-rgb on            turn RGB on\n  scrollock-rgb off           turn RGB off\n  scrollock-rgb toggle        flip RGB on/off\n  scrollock-rgb fix           one-time setup so ScrollLock toggles RGB (then reboot)\n  scrollock-rgb doctor        check what is wrong"
+    long_about = "RGB control for keyboards whose backlight follows the ScrollLock LED.\n\nEXAMPLES:\n  scrollock-rgb               show RGB state\n  scrollock-rgb on            turn RGB on\n  scrollock-rgb off           turn RGB off\n  scrollock-rgb toggle        flip RGB on/off\n  scrollock-rgb fix           one-time setup so ScrollLock toggles RGB\n  scrollock-rgb doctor        check what is wrong"
 )]
 struct Cli {
-    /// Do not try sudo elevation (internal flag, prevents recursion)
+    /// Do not try pkexec/sudo elevation (internal flag, prevents recursion)
     #[arg(long, hide = true, global = true)]
     no_elevate: bool,
 
@@ -88,17 +114,25 @@ enum Cmd {
         #[arg(long, hide = true)]
         all: bool,
     },
-    /// Keep RGB on across Caps/Num presses; follows your ScrollLock toggle
+    /// Repair Caps/Num kills without fighting the desktop's ScrollLock state
     #[command(visible_aliases = ["watch", "daemon", "protect"])]
     Guard {
         #[arg(long)]
         device: Option<String>,
         #[arg(long, hide = true)]
         all: bool,
-        /// Leave Caps/Num indicator lights alone (default: keep them off so
-        /// they cannot cut RGB power on firmware where the circuits interact)
+        /// Keep Caps/Num indicator LEDs off (legacy workaround for broken
+        /// firmware; normally unnecessary after `scrollock-rgb fix`)
         #[arg(long)]
+        suppress_lock_leds: bool,
+        /// Deprecated alias: lock LEDs are kept on by default now
+        #[arg(long, hide = true)]
         keep_lock_leds: bool,
+        /// Toggle the LED yourself on ScrollLock key presses. Only needed for
+        /// old/compositor-less setups where ScrollLock is not handled at all;
+        /// this is what caused flicker on Hyprland before `fix`.
+        #[arg(long)]
+        emulate_toggle: bool,
         /// Check interval in ms (smaller = faster repair, more wakeups)
         #[arg(long, default_value_t = 50)]
         interval_ms: u64,
@@ -112,9 +146,19 @@ enum Cmd {
     /// Check what is wrong (XKB setup, LED state)
     #[command(visible_aliases = ["check", "diag"])]
     Doctor,
-    /// One-time setup so ScrollLock toggles RGB (needs reboot after)
-    #[command(visible_aliases = ["fix", "repair", "setup"])]
-    FixXkb,
+    /// One-time setup so ScrollLock toggles RGB (no root needed)
+    #[command(
+        name = "fix",
+        visible_aliases = ["fix-xkb", "repair", "setup"]
+    )]
+    FixXkb {
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Undo the old system-wide symbols/pc patch (safe check)
+        #[arg(long)]
+        restore_legacy: bool,
+    },
     /// Low-level hardware details (for bug reports)
     #[command(visible_aliases = ["info", "details"])]
     Probe,
@@ -126,7 +170,7 @@ enum Cmd {
 struct LedState {
     base: PathBuf, // e.g. /sys/class/leds/input5::scrolllock
     brightness_path: PathBuf,
-    trigger_path: PathBuf,
+    trigger_path: Option<PathBuf>,
     brightness: u8,
     max_brightness: u8,
     trigger_active: String, // e.g. "none" parsed from "[none]"
@@ -228,10 +272,11 @@ fn read_led(input: &str, kind: &str) -> Option<LedState> {
         return None;
     }
     let brightness_path = base.join("brightness");
-    let trigger_path = base.join("trigger");
-    if !brightness_path.is_file() || !trigger_path.is_file() {
+    if !brightness_path.is_file() {
         return None;
     }
+    let trigger_path = base.join("trigger");
+    let has_trigger = trigger_path.is_file();
     let brightness = read_trim(&brightness_path)
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(0);
@@ -239,12 +284,16 @@ fn read_led(input: &str, kind: &str) -> Option<LedState> {
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(1)
         .min(16);
-    let trigger_raw = read_trim(&trigger_path).unwrap_or_default();
+    let trigger_raw = if has_trigger {
+        read_trim(&trigger_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let trigger_active = parse_trigger_active(&trigger_raw);
     Some(LedState {
         base,
         brightness_path,
-        trigger_path,
+        trigger_path: has_trigger.then_some(trigger_path),
         brightness,
         max_brightness,
         trigger_active,
@@ -344,14 +393,22 @@ fn intended_path(input: &str) -> Option<PathBuf> {
 
 /// Last RGB intent (true = on). Missing/unreadable file means "no memory yet".
 fn load_intended(input: &str) -> Option<bool> {
+    load_intent_record(input).map(|(on, _)| on)
+}
+
+/// State-file record plus a write timestamp. The guard uses the timestamp to
+/// tell a CLI `on`/`off` command from its own adoption of a compositor change.
+fn load_intent_record(input: &str) -> Option<(bool, u128)> {
     let p = intended_path(input)?;
-    // State files are written by us as "1\n"/"0\n"; bound the read anyway.
     let s = fs::read_to_string(&p).ok()?;
-    match s.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    }
+    let mut fields = s.split_whitespace();
+    let on = match fields.next()? {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    let stamp = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    Some((on, stamp))
 }
 
 /// Remember RGB intent. Best effort: the boot daemon runs as root and can
@@ -364,24 +421,35 @@ fn save_intended(input: &str, on: bool) {
     if fs::create_dir_all(STATE_DIR).is_err() {
         return;
     }
-    let _ = fs::write(p, if on { "1\n" } else { "0\n" });
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let _ = fs::write(p, format!("{}\n{}\n", if on { 1 } else { 0 }, stamp));
 }
 
-// ---- validated privileged writes + sudo ----
+// ---- validated privileged writes ----
 
 /// Validate that `path` is a real sysfs LED file before writing.
 fn validate_sysfs_file(path: &Path, expect: &str) -> Result<PathBuf, String> {
     if path.as_os_str().len() > 256 {
         return Err("sysfs path too long".into());
     }
-    let canon = fs::canonicalize(path).map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
+    let canon =
+        fs::canonicalize(path).map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
     let s = canon.to_string_lossy();
     if !s.starts_with("/sys/devices/") {
-        return Err(format!("refusing to write outside /sys/devices: {}", path.display()));
+        return Err(format!(
+            "refusing to write outside /sys/devices: {}",
+            path.display()
+        ));
     }
     match canon.file_name().and_then(|n| n.to_str()) {
         Some(n) if n == expect => Ok(canon),
-        _ => Err(format!("refusing to write unexpected file: {}", path.display())),
+        _ => Err(format!(
+            "refusing to write unexpected file: {}",
+            path.display()
+        )),
     }
 }
 
@@ -399,10 +467,13 @@ fn write_sysfs(path: &Path, expect: &str, value: &str) -> Result<(), String> {
 }
 
 fn write_trigger_none(led: &LedState) -> Result<(), String> {
+    let Some(trigger_path) = &led.trigger_path else {
+        return Ok(());
+    };
     if led.trigger_active == "none" {
         return Ok(());
     }
-    write_sysfs(&led.trigger_path, "trigger", "none\n")
+    write_sysfs(trigger_path, "trigger", "none\n")
 }
 
 fn write_brightness(led: &LedState, value: u8) -> Result<(), String> {
@@ -410,7 +481,11 @@ fn write_brightness(led: &LedState, value: u8) -> Result<(), String> {
     if led.brightness == v {
         return Ok(());
     }
-    write_sysfs(&led.brightness_path, "brightness", if v > 0 { "1\n" } else { "0\n" })
+    write_sysfs(
+        &led.brightness_path,
+        "brightness",
+        if v > 0 { "1\n" } else { "0\n" },
+    )
 }
 
 /// Refresh cached LED state from sysfs (bounded, non-panicking).
@@ -419,9 +494,11 @@ fn reread(led: &LedState) -> LedState {
     l.brightness = read_trim(&l.brightness_path)
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(l.brightness);
-    let raw = read_trim(&l.trigger_path).unwrap_or_default();
-    l.trigger_active = parse_trigger_active(&raw);
-    l.trigger_raw = raw;
+    if let Some(trigger_path) = &l.trigger_path {
+        let raw = read_trim(trigger_path).unwrap_or_default();
+        l.trigger_active = parse_trigger_active(&raw);
+        l.trigger_raw = raw;
+    }
     l
 }
 
@@ -430,7 +507,7 @@ fn reread(led: &LedState) -> LedState {
 fn apply_scroll(kb: &Keyboard, want_on: bool) -> Result<bool, String> {
     let scroll = reread(&kb.scroll);
     let mut changed = false;
-    if scroll.trigger_active != "none" {
+    if scroll.trigger_path.is_some() && scroll.trigger_active != "none" {
         write_trigger_none(&scroll)?;
         changed = true;
     }
@@ -452,96 +529,125 @@ fn apply_scroll(kb: &Keyboard, want_on: bool) -> Result<bool, String> {
     Ok(changed)
 }
 
-fn needs_elevation_error(msg: &str) -> bool {
-    msg.contains("Permission denied") || msg.contains("permission denied")
+fn sysfs_writable(kb: &Keyboard) -> bool {
+    path_writable(&kb.scroll.brightness_path)
+        && kb
+            .scroll
+            .trigger_path
+            .as_deref()
+            .map(path_writable)
+            .unwrap_or(true)
 }
 
-fn elevate_self() -> ! {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !Path::new("/usr/bin/sudo").exists() && !Path::new("/bin/sudo").exists() {
-        eprintln!("need permission to touch keyboard LEDs and sudo is missing.");
-        eprintln!("Run as root (the boot service already runs as root).");
-        process::exit(1);
-    }
-    eprintln!("need permission, re-running with sudo…");
-    let mut cmd = Command::new("sudo");
-    cmd.arg(exe);
-    cmd.args(&args);
-    if !args.iter().any(|a| a == "--no-elevate") {
-        cmd.arg("--no-elevate");
-    }
-    match cmd.status() {
-        Ok(st) => process::exit(st.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("failed to run sudo: {e}");
-            process::exit(1);
-        }
+fn path_writable(path: &Path) -> bool {
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::PermissionDenied,
     }
 }
 
-// ---- XKB one-time setup ----
-
-const XKB_PC: &str = "/usr/share/X11/xkb/symbols/pc";
-const XKB_LINE: &str = "    modifier_map Mod3 { Scroll_Lock };";
-
-fn xkb_pc_path() -> Result<PathBuf, String> {
-    let p = Path::new(XKB_PC);
-    let canon = fs::canonicalize(p).map_err(|e| format!("xkb file missing {XKB_PC}: {e}"))?;
-    if canon.file_name().and_then(|n| n.to_str()) != Some("pc") {
-        return Err(format!("refusing unexpected xkb path: {}", canon.display()));
-    }
-    if canon.parent().and_then(|n| n.file_name()).and_then(|n| n.to_str()) != Some("symbols") {
-        return Err(format!("refusing unexpected xkb path: {}", canon.display()));
-    }
-    let s = canon.to_string_lossy();
-    if !(s.starts_with("/usr/share/X11/xkb/symbols/")
-        || s.starts_with("/usr/share/xkeyboard-config-2/symbols/"))
-    {
-        return Err(format!("refusing unexpected xkb path: {}", canon.display()));
-    }
-    Ok(canon)
-}
-
-fn xkb_fixed() -> bool {
-    let Ok(text) = fs::read_to_string(XKB_PC) else {
-        return false;
-    };
-    for line in text.lines().take(500) {
-        let t = line.trim();
-        if t.starts_with("//") || t.starts_with('#') {
-            continue;
-        }
-        if t.contains("modifier_map") && t.contains("Mod3") && t.contains("Scroll_Lock") {
-            return true;
-        }
-    }
-    false
-}
+// ---- user commands ----
 
 fn cmd_doctor() -> i32 {
-    let mut need_fix = false;
     println!("== scrollock-rgb check ==");
-    if xkb_fixed() {
-        println!("[OK] ScrollLock key toggles RGB ({XKB_PC} has the Mod3 setup)");
-    } else {
-        println!("[FAIL] ScrollLock key is not set up to toggle RGB.");
-        println!("       Run `scrollock-rgb fix`, then reboot, then press ScrollLock once.");
-        need_fix = true;
-        if let Err(e) = xkb_pc_path() {
-            println!("       (path check: {e})");
+    if is_root() {
+        println!("note: running as root; session/config checks may be inaccurate.");
+    }
+
+    let session = desktop::detect_session();
+    let home = home_dir();
+    let config = config_home();
+    println!("session: {}", session.label());
+
+    let mut rc = 0;
+
+    match desktop::xkb_option_supported(home.as_deref()) {
+        Ok(base) => println!(
+            "[OK] xkeyboard-config supports scrolllock:mod3 ({})",
+            base.display()
+        ),
+        Err(e) => {
+            println!("[FAIL] {e}");
+            println!("       Install/update it: {}", util::xkb_install_hint());
+            rc = 1;
         }
     }
+
+    let runtime = desktop::runtime_xkb(&session);
+    let configured = desktop::configured_xkb(&session, home.as_deref(), config.as_deref());
+    let runtime_has = runtime
+        .as_ref()
+        .map(|r| xkb_options_contain(&r.options, XKB_OPTION))
+        .unwrap_or(false);
+    let configured_has = configured
+        .as_ref()
+        .map(|c| xkb_options_contain(&c.options, XKB_OPTION))
+        .unwrap_or(false);
+    let legacy = desktop::legacy_patch_present(home.as_deref());
+
+    if runtime_has {
+        let source = runtime
+            .as_ref()
+            .map(|r| r.source.as_str())
+            .unwrap_or("session");
+        println!("[OK] XKB: ScrollLock is mapped to Mod3 ({source})");
+    } else if configured_has {
+        let source = configured
+            .as_ref()
+            .map(|c| c.source.as_str())
+            .unwrap_or("config");
+        if runtime.is_some() {
+            println!("[WARN] XKB: scrolllock:mod3 is configured ({source}) but not active yet.");
+            println!("       Log out/in so the compositor rebuilds its keymap.");
+            if session.kind == DesktopKind::Hyprland {
+                println!("       Hyprland: `hyprctl reload` may be enough.");
+            }
+        } else {
+            println!("[OK] XKB: scrolllock:mod3 is configured ({source}); live state unavailable");
+        }
+    } else if legacy {
+        println!("[OK] XKB: old system-wide symbols/pc patch is active (obsolete)");
+        println!("       Run `scrollock-rgb fix` to migrate to the clean per-desktop option.");
+    } else {
+        println!("[FAIL] XKB: ScrollLock is not mapped to Mod3 for this session.");
+        println!("       Run `scrollock-rgb fix` (no root needed).");
+        if session.kind == DesktopKind::Hyprland {
+            println!("       Hyprland re-syncs LEDs to its XKB state on every key press;");
+            println!("       without this option the RGB backlight will flicker while typing.");
+        }
+        rc = 1;
+    }
+
+    if legacy {
+        println!("[WARN] old system-wide symbols/pc patch detected (obsolete).");
+        println!("       Remove it safely with: scrollock-rgb fix --restore-legacy");
+    }
+
+    if let Some((_, stdout, _)) = run_output("systemctl", &["is-active", "scrollock-rgb.service"]) {
+        let state = stdout.trim();
+        if !state.is_empty() {
+            if state == "active" {
+                println!("[OK] guard service is active");
+            } else {
+                println!("[WARN] guard service: {state}");
+            }
+        }
+    }
+
     match discover() {
         Ok(kbs) if kbs.is_empty() => {
             println!("[FAIL] no RGB keyboard found");
-            need_fix = true;
+            rc = 1;
         }
         Ok(kbs) => {
             for k in &kbs {
-                let st = if k.scroll.brightness > 0 { "on " } else { "off" };
+                let st = if k.scroll.brightness > 0 {
+                    "on "
+                } else {
+                    "off"
+                };
                 println!(
-                    "[{}] {} ({}) Caps/Num lights={}/{} (want off)",
+                    "[{}] {} ({}) Caps/Num lights={}/{}",
                     st,
                     k.input,
                     k.device_name,
@@ -552,94 +658,11 @@ fn cmd_doctor() -> i32 {
         }
         Err(e) => {
             println!("[FAIL] search: {e}");
-            need_fix = true;
+            rc = 1;
         }
     }
-    if need_fix { 1 } else { 0 }
+    rc
 }
-
-fn cmd_fix_xkb(no_elevate: bool) -> i32 {
-    let path = match xkb_pc_path() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("setup: {e}");
-            return 1;
-        }
-    };
-    let meta = match fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("setup: cannot read keyboard layout file: {e}");
-            return 1;
-        }
-    };
-    if meta.len() > 1_000_000 {
-        eprintln!("setup: refusing oversized layout file ({} bytes)", meta.len());
-        return 1;
-    }
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("setup: cannot read layout file: {e}");
-            return 1;
-        }
-    };
-    if text.contains(XKB_LINE) && xkb_fixed() {
-        println!("already set up. If RGB still misbehaves you may need to reboot");
-        println!("first (the desktop reads the layout at login), then press ScrollLock once.");
-        return 0;
-    }
-    let lines: Vec<String> = text.lines().take(500).map(|s| s.to_string()).collect();
-    if text.lines().count() > 500 {
-        eprintln!("setup: refusing unexpected layout file (>500 lines)");
-        return 1;
-    }
-    let mut idx: Option<usize> = None;
-    for (i, l) in lines.iter().enumerate() {
-        let t = l.trim();
-        if t.starts_with("//") || t.starts_with('#') {
-            continue;
-        }
-        if l.contains("<SCLK>") && l.contains("Scroll_Lock") {
-            idx = Some(i);
-            break;
-        }
-    }
-    let i = match idx {
-        Some(i) => i,
-        None => {
-            eprintln!("setup: ScrollLock key entry not found, refusing to patch blindly.");
-            return 1;
-        }
-    };
-    let mut patched = lines;
-    patched.insert(i + 1, XKB_LINE.to_string());
-    let out = patched.join("\n") + "\n";
-    if out.len() > 1_000_000 {
-        eprintln!("setup: patched output too large, aborting.");
-        return 1;
-    }
-    let bak = Path::new("/usr/share/X11/xkb/symbols/pc.bak-scrollock-rgb");
-    let write_it = || -> Result<(), String> {
-        if !bak.exists() {
-            let orig = fs::read(&path).map_err(|e| format!("backup read: {e}"))?;
-            fs::write(bak, orig).map_err(|e| format!("backup write {}: {e}", bak.display()))?;
-        }
-        fs::write(&path, out.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
-    };
-    match write_it() {
-        Ok(()) => {}
-        Err(e) if !no_elevate && needs_elevation_error(&e) => elevate_self(),
-        Err(e) => {
-            eprintln!("setup: {e}");
-            return 1;
-        }
-    }
-    println!("done. Reboot (or log out/in), then press ScrollLock once to light RGB.");
-    0
-}
-
-// ---- user commands ----
 
 fn cmd_status(filter_arg: Option<String>) -> i32 {
     match discover() {
@@ -655,7 +678,11 @@ fn cmd_status(filter_arg: Option<String>) -> i32 {
                         continue;
                     }
                 }
-                let st = if k.scroll.brightness > 0 { "on " } else { "off" };
+                let st = if k.scroll.brightness > 0 {
+                    "on "
+                } else {
+                    "off"
+                };
                 println!(
                     "RGB {} — {} ({}) Caps light={} Num light={}",
                     st,
@@ -693,9 +720,19 @@ fn cmd_set(want: Option<u8>, device: Option<String>, all: bool, no_elevate: bool
             return 1;
         }
     };
-    if !xkb_fixed() && want.map(|v| v > 0).unwrap_or(true) {
-        eprintln!("note: ScrollLock-key setup is missing — run `scrollock-rgb fix` + reboot");
-        eprintln!("for the key itself to toggle RGB; turning RGB on directly for now…");
+    let turning_on = want.map(|v| v > 0).unwrap_or(true);
+    if turning_on && !is_root() {
+        let session = desktop::detect_session();
+        let home = home_dir();
+        let config = config_home();
+        if !desktop::xkb_is_configured(&session, home.as_deref(), config.as_deref()) {
+            eprintln!("note: ScrollLock is not set up as an XKB modifier for this session.");
+            eprintln!("      Run `scrollock-rgb fix` once (no root) so Caps/Num cannot kill RGB.");
+            if session.kind == DesktopKind::Hyprland {
+                eprintln!("      Hyprland will make the RGB flicker until this is fixed.");
+            }
+            eprintln!("      Turning RGB on directly for now…");
+        }
     }
     let mut rc = 0;
     for t in targets {
@@ -703,9 +740,11 @@ fn cmd_set(want: Option<u8>, device: Option<String>, all: bool, no_elevate: bool
             Some(v) => v > 0,
             None => reread(&t.scroll).brightness == 0,
         };
+        // Write the command marker first: the guard may poll the LED between
+        // the brightness write and a later save, especially while Caps is on.
+        save_intended(&t.input, want_on);
         match apply_scroll(t, want_on) {
             Ok(_) => {
-                save_intended(&t.input, want_on);
                 println!(
                     "{} ({}): RGB {}",
                     t.input,
@@ -725,10 +764,94 @@ fn cmd_set(want: Option<u8>, device: Option<String>, all: bool, no_elevate: bool
     rc
 }
 
-fn sysfs_writable(path: &Path) -> bool {
-    match fs::OpenOptions::new().write(true).open(path) {
-        Ok(_) => true,
-        Err(e) => e.kind() != io::ErrorKind::PermissionDenied,
+fn cmd_fix_xkb(dry_run: bool, restore_legacy: bool, no_elevate: bool) -> i32 {
+    desktop::fix_xkb(dry_run, restore_legacy, no_elevate)
+}
+
+// ---- guard ----
+
+enum MonitorMsg {
+    Scroll(String),
+    Lock(String),
+    Closed(String),
+}
+
+/// Read one evdev node and report ScrollLock key presses.
+///
+/// `struct input_event` is 24 bytes on 64-bit Linux and 16 bytes on 32-bit
+/// (the timeval at the front is pointer-sized). Parsing the tail keeps this
+/// correct on both, unlike a hardcoded 24-byte read.
+fn monitor_event_node(path: String, input: String, tx: mpsc::Sender<MonitorMsg>) {
+    use std::io::Read;
+
+    const EVENT_SIZE: usize = if cfg!(target_pointer_width = "64") {
+        24
+    } else {
+        16
+    };
+
+    let Ok(mut file) = fs::File::open(&path) else {
+        thread::sleep(Duration::from_millis(500));
+        let _ = tx.send(MonitorMsg::Closed(path));
+        return;
+    };
+    let mut buf = [0u8; EVENT_SIZE];
+    loop {
+        if file.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let off = EVENT_SIZE - 8;
+        let ev_type = u16::from_le_bytes([buf[off], buf[off + 1]]);
+        let ev_code = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+        let ev_value = i32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+        // EV_KEY, value 1 == press. Report ScrollLock toggles and Caps/Num
+        // presses; follow mode uses them to tell a user toggle from a kill.
+        if ev_type == EV_KEY && ev_value == 1 {
+            let msg = match ev_code {
+                KEY_SCROLLLOCK => Some(MonitorMsg::Scroll(input.clone())),
+                KEY_CAPSLOCK | KEY_NUMLOCK => Some(MonitorMsg::Lock(input.clone())),
+                _ => None,
+            };
+            if let Some(msg) = msg {
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    thread::sleep(Duration::from_millis(250));
+    let _ = tx.send(MonitorMsg::Closed(path));
+}
+
+fn drain_monitor_messages(
+    rx: &mpsc::Receiver<MonitorMsg>,
+    intents: &mut HashMap<String, bool>,
+    last_toggle: &mut HashMap<String, Instant>,
+    monitored: &mut HashSet<String>,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            MonitorMsg::Scroll(input) => {
+                let now = Instant::now();
+                let duplicate = last_toggle
+                    .get(&input)
+                    .map(|t| now.duration_since(*t) < Duration::from_millis(120))
+                    .unwrap_or(false);
+                if duplicate {
+                    continue;
+                }
+                last_toggle.insert(input.clone(), now);
+                let intended = intents
+                    .entry(input.clone())
+                    .or_insert_with(|| load_intended(&input).unwrap_or(true));
+                *intended = !*intended;
+                save_intended(&input, *intended);
+            }
+            MonitorMsg::Lock(_) => {}
+            MonitorMsg::Closed(path) => {
+                monitored.remove(&path);
+            }
+        }
     }
 }
 
@@ -741,14 +864,14 @@ fn guard_step(
     intended_on: &mut bool,
     suppress_locks: bool,
 ) -> Result<Option<String>, String> {
-    // Locks first: a lit Caps/Num LED is what latches RGB off on some
-    // firmware, so clear those before touching ScrollLock.
+    // Optional legacy workaround: a lit Caps/Num LED is what latches RGB off
+    // on a few broken firmwares. After the XKB fix this is unnecessary.
     let mut lock_activity = false;
     if suppress_locks {
-        for (_label, slot) in [("caps", &kb.caps), ("num", &kb.num)] {
+        for slot in [&kb.caps, &kb.num] {
             let Some(led) = slot else { continue };
             let cur = reread(led);
-            let trig_bad = cur.trigger_active != "none";
+            let trig_bad = cur.trigger_path.is_some() && cur.trigger_active != "none";
             let lit = cur.brightness != 0;
             if trig_bad {
                 write_trigger_none(&cur)?;
@@ -764,7 +887,7 @@ fn guard_step(
 
     // ScrollLock trigger always detached so the kernel never auto-drives it.
     let s = reread(&kb.scroll);
-    if s.trigger_active != "none" {
+    if s.trigger_path.is_some() && s.trigger_active != "none" {
         write_trigger_none(&s)?;
     }
 
@@ -796,15 +919,191 @@ fn guard_step(
     }
 }
 
+/// State for the default "follow the compositor" guard mode.
+///
+/// The desktop owns the ScrollLock LED once `scrolllock:mod3` is active. The
+/// guard must therefore *follow* LED changes (user toggles, compositor resets)
+/// instead of enforcing a remembered toggle, otherwise the two fight and the
+/// RGB flickers. Caps/Num kills are the only thing the guard repairs.
+struct FollowState {
+    last_on: bool,
+    caps: Option<u8>,
+    num: Option<u8>,
+    /// Last state-file record seen, used to recognise `on`/`off`/`toggle`
+    /// commands even when a lock LED is lit.
+    file_record: Option<(bool, u128)>,
+    /// A Caps/Num key press (or lock-LED activity) was seen recently.
+    lock_until: Option<Instant>,
+    /// A physical ScrollLock key press was seen recently; this is a user
+    /// toggle, not a Caps/Num kill.
+    scroll_until: Option<Instant>,
+}
+
+fn drain_follow_messages(
+    rx: &mpsc::Receiver<MonitorMsg>,
+    states: &mut HashMap<String, FollowState>,
+    monitored: &mut HashSet<String>,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            MonitorMsg::Scroll(input) => {
+                if let Some(state) = states.get_mut(&input) {
+                    state.scroll_until = Some(Instant::now() + Duration::from_millis(250));
+                }
+            }
+            MonitorMsg::Lock(input) => {
+                if let Some(state) = states.get_mut(&input) {
+                    state.lock_until = Some(Instant::now() + Duration::from_millis(400));
+                }
+            }
+            MonitorMsg::Closed(path) => {
+                monitored.remove(&path);
+            }
+        }
+    }
+}
+
+fn lock_brightness(led: &Option<LedState>) -> Option<u8> {
+    led.as_ref().map(|l| reread(l).brightness)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowAction {
+    Keep,
+    Adopt,
+    Repair,
+}
+
+/// Decide whether an observed ScrollLock LED change is a user toggle / normal
+/// compositor update (adopt it) or a Caps/Num kill (repair it).
+fn follow_action(
+    last_on: bool,
+    cur_on: bool,
+    recent_lock: bool,
+    user_toggle: bool,
+    command_changed: bool,
+) -> FollowAction {
+    if cur_on == last_on {
+        FollowAction::Keep
+    } else if command_changed || user_toggle {
+        FollowAction::Adopt
+    } else if !cur_on && last_on && recent_lock {
+        FollowAction::Repair
+    } else {
+        FollowAction::Adopt
+    }
+}
+
+/// Observe the LEDs, repair a Caps/Num kill, and otherwise adopt whatever the
+/// compositor decided. A Caps/Num kill is a ScrollLock LED drop that happens
+/// together with lock-LED activity; a normal ScrollLock toggle has no such
+/// activity and is accepted.
+fn guard_step_follow(
+    kb: &Keyboard,
+    state: &mut FollowState,
+    suppress_locks: bool,
+) -> Result<Option<String>, String> {
+    let now = Instant::now();
+    let mut caps = lock_brightness(&kb.caps);
+    let mut num = lock_brightness(&kb.num);
+
+    let lock_activity =
+        caps != state.caps || num != state.num || caps.unwrap_or(0) > 0 || num.unwrap_or(0) > 0;
+    if lock_activity {
+        state.lock_until = Some(now + Duration::from_millis(400));
+    }
+
+    if suppress_locks {
+        for led in [&kb.caps, &kb.num].into_iter().flatten() {
+            let cur = reread(led);
+            let trig_bad = cur.trigger_path.is_some() && cur.trigger_active != "none";
+            let lit = cur.brightness != 0;
+            if trig_bad {
+                write_trigger_none(&cur)?;
+            }
+            if lit {
+                write_brightness(&reread(led), 0)?;
+            }
+        }
+        caps = lock_brightness(&kb.caps);
+        num = lock_brightness(&kb.num);
+    }
+    state.caps = caps;
+    state.num = num;
+
+    // Keep the kernel from auto-driving the ScrollLock LED.
+    let s = reread(&kb.scroll);
+    if s.trigger_path.is_some() && s.trigger_active != "none" {
+        write_trigger_none(&s)?;
+    }
+
+    let cur = reread(&kb.scroll);
+    let cur_on = cur.brightness > 0;
+    let recent_lock = state.lock_until.map(|t| now <= t).unwrap_or(false);
+    let user_toggle = state.scroll_until.map(|t| now <= t).unwrap_or(false);
+    let file_record = load_intent_record(&kb.input);
+    let command_changed = file_record != state.file_record;
+    if command_changed {
+        state.file_record = file_record;
+    }
+    if std::env::var_os("SCROLLOCK_RGB_DEBUG").is_some() {
+        eprintln!(
+            "debug {} last_on={} cur_on={} caps={:?} num={:?} lock={} scroll_key={} command={}",
+            kb.input, state.last_on, cur_on, caps, num, recent_lock, user_toggle, command_changed
+        );
+    }
+
+    match follow_action(
+        state.last_on,
+        cur_on,
+        recent_lock,
+        user_toggle,
+        command_changed,
+    ) {
+        FollowAction::Keep => Ok(None),
+        FollowAction::Repair => {
+            write_brightness(&cur, 1)?;
+            let verify = reread(&kb.scroll);
+            if verify.brightness == 0 {
+                return Err(format!(
+                    "{}: could not restore RGB (trigger={})",
+                    kb.input, verify.trigger_active
+                ));
+            }
+            state.lock_until = None;
+            Ok(Some(format!(
+                "{}: RGB back on (a Caps/Num press had turned it off)",
+                kb.input
+            )))
+        }
+        FollowAction::Adopt => {
+            // A real user toggle, a CLI command, or a compositor reset:
+            // accept it and remember it for the next boot. Each write gets a
+            // fresh timestamp, so the next CLI command stays distinguishable.
+            state.last_on = cur_on;
+            state.lock_until = None;
+            state.scroll_until = None;
+            save_intended(&kb.input, cur_on);
+            state.file_record = load_intent_record(&kb.input);
+            if cur_on {
+                Ok(Some(format!("{}: RGB on", kb.input)))
+            } else {
+                Ok(Some(format!("{}: RGB off", kb.input)))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_guard(
     device: Option<String>,
     all: bool,
-    keep_lock_leds: bool,
+    suppress_locks: bool,
+    emulate_toggle: bool,
     interval_ms: u64,
     iterations: u64,
     no_elevate: bool,
 ) -> i32 {
-    let suppress_locks = !keep_lock_leds;
     let interval = Duration::from_millis(interval_ms.clamp(20, 2000));
     let pre = match discover() {
         Ok(v) => v,
@@ -824,13 +1123,36 @@ fn cmd_guard(
         eprintln!("watch: no matching keyboards");
         return 1;
     }
-    if !no_elevate
-        && pre_targets.iter().any(|t| {
-            !sysfs_writable(&t.scroll.brightness_path) || !sysfs_writable(&t.scroll.trigger_path)
-        })
-    {
+    if !no_elevate && pre_targets.iter().any(|t| !sysfs_writable(t)) {
         elevate_self();
     }
+
+    // Warn about the Hyprland flicker when running from a user session.
+    let session = desktop::detect_session();
+    if session.kind == DesktopKind::Hyprland {
+        let home = home_dir();
+        let config = config_home();
+        if !desktop::xkb_is_configured(&session, home.as_deref(), config.as_deref()) {
+            eprintln!("warning: Hyprland controls the ScrollLock LED and scrolllock:mod3");
+            eprintln!("         is not configured. The RGB may flicker while typing.");
+            eprintln!("         Run `scrollock-rgb fix` once, then log out/in.");
+        }
+    }
+
+    if !emulate_toggle {
+        return cmd_guard_follow(
+            &pre_targets,
+            &device,
+            all,
+            interval,
+            iterations,
+            suppress_locks,
+            no_elevate,
+        );
+    }
+
+    // --emulate-toggle: the old pre-fix behaviour. Kept only as an explicit
+    // escape hatch; the service uses follow mode so it cannot fight Hyprland.
     // Remember each keyboard's RGB intent across polls (and restarts, via
     // small state files). No file yet (first boot) means RGB on.
     let mut intents: HashMap<String, bool> = HashMap::new();
@@ -844,44 +1166,16 @@ fn cmd_guard(
         };
         intents.insert(t.input.clone(), v);
     }
+
     // Monitor ScrollLock key presses on the keyboards' event nodes so toggle
     // intent follows the physical key. This is independent of Caps/Num LED
     // state, which previously caused the guard to misclassify kills as toggles.
-    let (tx, rx) = mpsc::channel::<String>();
-    let mut seen_events: Vec<String> = Vec::new();
-    for t in &pre_targets {
-        for ev in &t.events {
-            if seen_events.iter().any(|e| e == ev) {
-                continue;
-            }
-            seen_events.push(ev.clone());
-            let path = ev.clone();
-            let input = t.input.clone();
-            let tx = tx.clone();
-            thread::spawn(move || {
-                use std::io::Read;
-                let Ok(mut f) = std::fs::File::open(&path) else {
-                    return;
-                };
-                let mut buf = [0u8; 24];
-                loop {
-                    if f.read_exact(&mut buf).is_err() {
-                        break;
-                    }
-                    let ev_type = u16::from_le_bytes([buf[16], buf[17]]);
-                    let ev_code = u16::from_le_bytes([buf[18], buf[19]]);
-                    let ev_value = i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
-                    // EV_KEY == 1, KEY_SCROLLLOCK == 70, value 1 == press
-                    if ev_type == 1 && ev_code == 70 && ev_value == 1 {
-                        let _ = tx.send(input.clone());
-                    }
-                }
-            });
-        }
-    }
+    let (tx, rx) = mpsc::channel::<MonitorMsg>();
+    let mut monitored: HashSet<String> = HashSet::new();
+    let mut last_toggle: HashMap<String, std::time::Instant> = HashMap::new();
 
     println!(
-        "watching {} keyboard(s) every {} ms — ScrollLock toggles RGB, Caps/Num cannot kill it (Ctrl-C to stop)…",
+        "watching {} keyboard(s) every {} ms — ScrollLock toggles RGB (Ctrl-C to stop)…",
         pre_targets.len(),
         interval.as_millis()
     );
@@ -905,24 +1199,42 @@ fn cmd_guard(
             eprintln!("watch: no matching keyboards");
             return 1;
         }
-        // Apply ScrollLock key toggles detected by the event monitor threads.
-        while let Ok(input) = rx.try_recv() {
-            if let Some(v) = intents.get_mut(&input) {
-                *v = !*v;
-                save_intended(&input, *v);
+
+        // Keep the event monitors in sync with hot-plugged keyboards.
+        let desired: HashSet<String> = targets
+            .iter()
+            .flat_map(|t| t.events.iter().cloned())
+            .collect();
+        monitored.retain(|p| desired.contains(p));
+        for t in &targets {
+            for ev in &t.events {
+                if monitored.insert(ev.clone()) {
+                    let tx = tx.clone();
+                    let input = t.input.clone();
+                    let path = ev.clone();
+                    thread::spawn(move || monitor_event_node(path, input, tx));
+                }
             }
         }
 
+        // Apply ScrollLock key toggles detected by the event monitor threads.
+        drain_monitor_messages(&rx, &mut intents, &mut last_toggle, &mut monitored);
+
         for t in targets {
-            let intended = intents.entry(t.input.clone()).or_insert_with(|| {
-                match load_intended(&t.input) {
-                    Some(v) => v,
-                    None => {
-                        save_intended(&t.input, true);
-                        true
-                    }
-                }
-            });
+            // Catch a key event that arrived while we were discovering devices,
+            // so a real ScrollLock-off toggle is not mistaken for a kill and
+            // repaired for one poll (which would look like a flash).
+            drain_monitor_messages(&rx, &mut intents, &mut last_toggle, &mut monitored);
+            let intended =
+                intents
+                    .entry(t.input.clone())
+                    .or_insert_with(|| match load_intended(&t.input) {
+                        Some(v) => v,
+                        None => {
+                            save_intended(&t.input, true);
+                            true
+                        }
+                    });
             // Pick up intent changes made by the CLI (or other processes).
             if let Some(v) = load_intended(&t.input) {
                 *intended = v;
@@ -942,11 +1254,172 @@ fn cmd_guard(
         if iterations > 0 && n >= iterations {
             return 0;
         }
-        std::thread::sleep(interval);
+        thread::sleep(interval);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_guard_follow(
+    pre_targets: &[&Keyboard],
+    device: &Option<String>,
+    all: bool,
+    interval: Duration,
+    iterations: u64,
+    suppress_locks: bool,
+    no_elevate: bool,
+) -> i32 {
+    let mut states: HashMap<String, FollowState> = HashMap::new();
+
+    // Apply the remembered intent once at startup (so "off" survives a
+    // reboot), then follow whatever the desktop does. No remembered toggle is
+    // enforced during the session: Hyprland/KDE own the LED after `fix`.
+    for t in pre_targets {
+        let intended = load_intended(&t.input).unwrap_or_else(|| {
+            save_intended(&t.input, true);
+            true
+        });
+        let before = reread(&t.scroll);
+        if (before.brightness > 0) != intended {
+            if let Err(e) = write_brightness(&before, if intended { 1 } else { 0 }) {
+                if !no_elevate && needs_elevation_error(&e) {
+                    elevate_self();
+                }
+                eprintln!("watch {}: {e}", t.input);
+            }
+        }
+        let now_on = reread(&t.scroll).brightness > 0;
+        let caps = lock_brightness(&t.caps);
+        let num = lock_brightness(&t.num);
+        states.insert(
+            t.input.clone(),
+            FollowState {
+                last_on: now_on,
+                caps,
+                num,
+                file_record: load_intent_record(&t.input),
+                lock_until: None,
+                scroll_until: None,
+            },
+        );
+    }
+
+    // Key monitors distinguish a real ScrollLock toggle from a Caps/Num kill.
+    let (tx, rx) = mpsc::channel::<MonitorMsg>();
+    let mut monitored: HashSet<String> = HashSet::new();
+
+    println!(
+        "watching {} keyboard(s) every {} ms — following the desktop; repairing Caps/Num kills (Ctrl-C to stop)…",
+        pre_targets.len(),
+        interval.as_millis()
+    );
+
+    let mut n: u64 = 0;
+    loop {
+        let kbs = match discover() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("watch: {e}");
+                return 1;
+            }
+        };
+        let targets = match filter(&kbs, device, all) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("watch: {e}");
+                return 1;
+            }
+        };
+        if targets.is_empty() {
+            eprintln!("watch: no matching keyboards");
+            return 1;
+        }
+        states.retain(|input, _| targets.iter().any(|t| &t.input == input));
+
+        // Register hot-plugged keyboards before draining their key events.
+        for t in &targets {
+            if !states.contains_key(&t.input) {
+                let now_on = reread(&t.scroll).brightness > 0;
+                states.insert(
+                    t.input.clone(),
+                    FollowState {
+                        last_on: now_on,
+                        caps: lock_brightness(&t.caps),
+                        num: lock_brightness(&t.num),
+                        file_record: load_intent_record(&t.input),
+                        lock_until: None,
+                        scroll_until: None,
+                    },
+                );
+            }
+        }
+
+        let desired: HashSet<String> = targets
+            .iter()
+            .flat_map(|t| t.events.iter().cloned())
+            .collect();
+        monitored.retain(|p| desired.contains(p));
+        for t in &targets {
+            for ev in &t.events {
+                if monitored.insert(ev.clone()) {
+                    let tx = tx.clone();
+                    let input = t.input.clone();
+                    let path = ev.clone();
+                    thread::spawn(move || monitor_event_node(path, input, tx));
+                }
+            }
+        }
+        drain_follow_messages(&rx, &mut states, &mut monitored);
+
+        for t in targets {
+            let Some(state) = states.get_mut(&t.input) else {
+                continue;
+            };
+            match guard_step_follow(t, state, suppress_locks) {
+                Ok(Some(line)) => println!("{line}"),
+                Ok(None) => {}
+                Err(e) => {
+                    if !no_elevate && needs_elevation_error(&e) {
+                        elevate_self();
+                    }
+                    eprintln!("watch {}: {e}", t.input);
+                }
+            }
+        }
+        n += 1;
+        if iterations > 0 && n >= iterations {
+            return 0;
+        }
+        thread::sleep(interval);
     }
 }
 
 fn cmd_probe() -> i32 {
+    let session = desktop::detect_session();
+    let home = home_dir();
+    let config = config_home();
+    println!("session : {}", session.label());
+    match desktop::xkb_option_supported(home.as_deref()) {
+        Ok(base) => println!("xkb data: {}", base.display()),
+        Err(e) => println!("xkb data: unavailable ({e})"),
+    }
+    match desktop::runtime_xkb(&session) {
+        Some(rt) => println!("xkb live: [{}] (from {})", rt.options, rt.source),
+        None => println!("xkb live: unavailable"),
+    }
+    match desktop::configured_xkb(&session, home.as_deref(), config.as_deref()) {
+        Some(cf) => println!("xkb conf: [{}] ({})", cf.options, cf.source),
+        None => println!("xkb conf: no config file found"),
+    }
+    println!(
+        "legacy  : {}",
+        if desktop::legacy_patch_present(home.as_deref()) {
+            "old symbols/pc patch present"
+        } else {
+            "none"
+        }
+    );
+    println!();
+
     match discover() {
         Ok(kbs) if kbs.is_empty() => {
             println!("no RGB keyboard found.");
@@ -965,17 +1438,26 @@ fn cmd_probe() -> i32 {
                     }
                 );
                 println!(
-                    "  scroll  : {} brightness={}/{} trigger=[{}] (this LED is the RGB switch)",
+                    "  scroll  : {} brightness={}/{} trigger={} (this LED is the RGB switch)",
                     k.scroll.base.display(),
                     k.scroll.brightness,
                     k.scroll.max_brightness,
-                    k.scroll.trigger_active
+                    if k.scroll.trigger_path.is_some() {
+                        format!("[{}]", k.scroll.trigger_active)
+                    } else {
+                        "-".to_string()
+                    }
                 );
                 for (label, slot) in [("caps", &k.caps), ("num", &k.num)] {
                     match slot {
                         Some(l) => println!(
-                            "  {label:<7}: brightness={} trigger=[{}]",
-                            l.brightness, l.trigger_active
+                            "  {label:<7}: brightness={} trigger={}",
+                            l.brightness,
+                            if l.trigger_path.is_some() {
+                                format!("[{}]", l.trigger_active)
+                            } else {
+                                "-".to_string()
+                            }
                         ),
                         None => println!("  {label:<7}: -"),
                     }
@@ -1010,14 +1492,120 @@ fn main() {
         Some(Cmd::Guard {
             device,
             all,
+            suppress_lock_leds,
             keep_lock_leds,
+            emulate_toggle,
             interval_ms,
             iterations,
             ..
-        }) => cmd_guard(device, all, keep_lock_leds, interval_ms, iterations, cli.no_elevate),
+        }) => {
+            let _ = keep_lock_leds;
+            cmd_guard(
+                device,
+                all,
+                suppress_lock_leds,
+                emulate_toggle,
+                interval_ms,
+                iterations,
+                cli.no_elevate,
+            )
+        }
         Some(Cmd::Doctor) => cmd_doctor(),
-        Some(Cmd::FixXkb) => cmd_fix_xkb(cli.no_elevate),
+        Some(Cmd::FixXkb {
+            dry_run,
+            restore_legacy,
+        }) => cmd_fix_xkb(dry_run, restore_legacy, cli.no_elevate),
         Some(Cmd::Probe) => cmd_probe(),
     };
     process::exit(rc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_parsing() {
+        assert_eq!(
+            parse_trigger_active("[none] usb-gadget kbd-scrolllock"),
+            "none"
+        );
+        assert_eq!(
+            parse_trigger_active("default [kbd-scrolllock] kbd-numlock"),
+            "kbd-scrolllock"
+        );
+        assert_eq!(parse_trigger_active("no brackets"), "");
+    }
+
+    #[test]
+    fn input_and_led_names_are_validated() {
+        assert!(valid_input_name("input4"));
+        assert!(valid_input_name("input123"));
+        assert!(!valid_input_name("input"));
+        assert!(!valid_input_name("input4::scrolllock"));
+        assert!(!valid_input_name("input4/../x"));
+        assert!(valid_led_name("input4::scrolllock"));
+        assert!(valid_led_name("input4::capslock"));
+        assert!(!valid_led_name("input4::backlight"));
+        assert!(!valid_led_name("../../input4::scrolllock"));
+    }
+
+    #[test]
+    fn follow_mode_adopts_toggles_and_repairs_kills() {
+        // A normal ScrollLock-off toggle has no lock-key activity.
+        assert_eq!(
+            follow_action(true, false, false, false, false),
+            FollowAction::Adopt
+        );
+        // A scroll-off press has a ScrollLock key event even if a lock LED
+        // also changed in the same poll.
+        assert_eq!(
+            follow_action(true, false, true, true, false),
+            FollowAction::Adopt
+        );
+        // An explicit CLI `off` wins even when Caps is lit.
+        assert_eq!(
+            follow_action(true, false, true, false, true),
+            FollowAction::Adopt
+        );
+        // Caps/Num activity + LED drop without a ScrollLock event is a kill.
+        assert_eq!(
+            follow_action(true, false, true, false, false),
+            FollowAction::Repair
+        );
+        // Off stays off; turning on is always accepted.
+        assert_eq!(
+            follow_action(false, false, true, false, false),
+            FollowAction::Keep
+        );
+        assert_eq!(
+            follow_action(false, true, false, false, false),
+            FollowAction::Adopt
+        );
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let led = LedState {
+            base: PathBuf::from("/tmp"),
+            brightness_path: PathBuf::from("/tmp"),
+            trigger_path: None,
+            brightness: 0,
+            max_brightness: 1,
+            trigger_active: String::new(),
+            trigger_raw: String::new(),
+        };
+        let kb = Keyboard {
+            input: "input4".into(),
+            device_name: "SEMICO USB Keyboard".into(),
+            vid_pid: Some("1a2c:6003".into()),
+            events: vec![],
+            scroll: led,
+            caps: None,
+            num: None,
+        };
+        assert!(matches(&kb, "semico"));
+        assert!(matches(&kb, "1A2C"));
+        assert!(!matches(&kb, "0c45"));
+    }
 }

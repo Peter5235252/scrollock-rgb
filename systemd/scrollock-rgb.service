@@ -1,17 +1,22 @@
 [Unit]
-Description=scrollock-rgb guard: keep ScrollLock RGB on, Caps/Num can never kill it
-Documentation=file:/home/csemanpeter/Projektek/scrollock-rgb/README.md
-After=local-fs.target systemd-udev-settle.service
-Wants=systemd-udev-settle.service
+Description=scrollock-rgb guard: keep ScrollLock RGB in sync, repair Caps/Num kills
+Documentation=https://github.com/Peter5235252/scrollock-rgb
+After=local-fs.target
+# The guard rediscovers keyboards continuously, so it does not need to wait
+# for udev to settle (that target is deprecated and slows boot).
 
 [Service]
 Type=simple
-# Persistent guard: follows your ScrollLock toggle, repairs Caps/Num kills
-# within one poll, keeps Caps/Num lights off (firmware latch prevention).
-# Runs as root (system unit) so no sudo/password is needed.
+# Persistent guard: follows the desktop's ScrollLock LED and repairs Caps/Num
+# kills within one poll. It does not enforce its own toggle, so it cannot
+# fight Hyprland/KDE and cause flicker. Runs as root (system unit), so no
+# password is needed. Add --suppress-lock-leds only for firmware that really
+# cuts RGB when a Caps/Num indicator LED is lit. For an old compositor that
+# does not handle ScrollLock at all, add --emulate-toggle (may flicker).
 ExecStart=/usr/local/bin/scrollock-rgb guard --interval-ms 50
 Restart=always
 RestartSec=1
+Nice=10
 
 [Install]
 WantedBy=multi-user.target
